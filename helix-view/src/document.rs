@@ -1014,6 +1014,8 @@ impl Document {
                     }
                 }
             }
+
+            // Resolve symlinks to determine the actual write path
             let write_path = tokio::fs::read_link(&path)
                 .await
                 .ok()
@@ -1034,93 +1036,102 @@ impl Document {
             }
 
             // Assume it is a hardlink to prevent data loss if the metadata cant be read (e.g. on certain Windows configurations)
-            let is_hardlink = helix_stdx::faccess::hardlink_count(&write_path).unwrap_or(2) > 1;
+            let file_exists = fs::try_exists(&write_path).await.unwrap_or(false);
+            // If file exists, check hardlinks. Atomic rename breaks hardlinks.
+            // If file doesn't exist, it's not a hardlink.
+            let is_hardlink = if file_exists {
+                helix_stdx::faccess::hardlink_count(&write_path).unwrap_or(2) > 1
+            } else {
+                false
+            };
             let is_symlink = match tokio::fs::symlink_metadata(&write_path).await {
                 Ok(meta) => meta.is_symlink(),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
                 Err(err) => return Err(err.into()),
             };
             let must_copy = is_hardlink || is_symlink;
-            let backup = if path.exists() && atomic_save {
-                let path_ = write_path.clone();
-                // hacks: we use tempfile to handle the complex task of creating
-                // non clobbered temporary path for us we don't want
-                // the whole automatically delete path on drop thing
-                // since the path doesn't exist yet, we just want
-                // the path
-                tokio::task::spawn_blocking(move || -> Option<PathBuf> {
+            let try_atomic = atomic_save && !must_copy;
+
+            let mut temp_path: Option<PathBuf> = None;
+            let mut file_handle: fs::File;
+
+            if try_atomic {
+                let parent_dir = write_path.parent().unwrap_or(&path).to_path_buf();
+                let file_extension = write_path.extension().map(|e| e.to_owned());
+
+                // Try to create the temp file.
+                // This implicitly checks if the directory is writable.
+                let temp_result = tokio::task::spawn_blocking(move || -> std::io::Result<(std::fs::File, PathBuf)> {
                     let mut builder = tempfile::Builder::new();
-                    builder.prefix(path_.file_name()?).suffix(".bck");
 
-                    let backup_path = if must_copy {
-                        builder
-                            .make_in(path_.parent()?, |backup| std::fs::copy(&path_, backup))
-                            .ok()?
-                            .into_temp_path()
-                    } else {
-                        builder
-                            .make_in(path_.parent()?, |backup| std::fs::rename(&path_, backup))
-                            .ok()?
-                            .into_temp_path()
-                    };
+                    let suffix_str;
+                    if let Some(ext) = file_extension {
+                        suffix_str = format!(".{}", ext.to_string_lossy());
+                        builder.suffix(&suffix_str);
+                    }
 
-                    backup_path.keep().ok()
-                })
-                .await
-                .ok()
-                .flatten()
+                    // This will fail if the directory is not writable
+                    let temp = builder.tempfile_in(parent_dir)?;
+                    let (file, path) = temp.keep()?;
+                    Ok((file, path))
+                }).await?;
+
+                match temp_result {
+                    Ok((temp_file, path)) => {
+                        // Atomic Strategy Success
+                        temp_path = Some(path);
+                        file_handle = fs::File::from_std(temp_file);
+                    }
+                    Err(e) => {
+                        // Atomic Strategy Failed (e.g. Directory not writable)
+                        // Fallback to Direct Strategy
+                        log::warn!("Atomic save failed (likely permissions), falling back to direct write: {}", e);
+                        // Open without O_EXCL (standard create) so it succeeds even if we raced
+                        file_handle = fs::File::create(&write_path).await?;
+                    }
+                }
             } else {
-                None
-            };
-
-            let write_result: anyhow::Result<_> = async {
-                let mut dst = tokio::fs::File::create(&write_path).await?;
-                to_writer(&mut dst, encoding_with_bom_info, &text).await?;
-                dst.sync_all().await?;
-                Ok(())
+                file_handle = fs::File::create(&write_path).await?;
             }
-            .await;
+
+            to_writer(&mut file_handle, encoding_with_bom_info, &text).await?;
+            file_handle.sync_all().await?;
 
             let save_time = match fs::metadata(&write_path).await {
                 Ok(metadata) => metadata.modified().map_or(SystemTime::now(), |mtime| mtime),
                 Err(_) => SystemTime::now(),
             };
 
-            if let Some(backup) = backup {
-                if must_copy {
-                    let mut delete = true;
-                    if write_result.is_err() {
-                        // Restore backup
-                        let _ = tokio::fs::copy(&backup, &write_path).await.map_err(|e| {
-                            delete = false;
-                            log::error!("Failed to restore backup on write failure: {e}")
-                        });
-                    }
+            if let Some(t_path) = temp_path {
+                // Copy Metadata if the original file existed
+                if file_exists {
+                    let from = write_path.clone();
+                    let to = t_path.clone();
 
-                    if delete {
-                        // Delete backup
-                        let _ = tokio::fs::remove_file(backup)
-                            .await
-                            .map_err(|e| log::error!("Failed to remove backup file on write: {e}"));
-                    }
-                } else if write_result.is_err() {
-                    // restore backup
-                    let _ = tokio::fs::rename(&backup, &write_path)
-                        .await
-                        .map_err(|e| log::error!("Failed to restore backup on write failure: {e}"));
-                } else {
-                    // copy metadata and delete backup
                     let _ = tokio::task::spawn_blocking(move || {
-                        let _ = copy_metadata(&backup, &write_path)
+                        let _ = copy_metadata(&from, &to)
                             .map_err(|e| log::error!("Failed to copy metadata on write: {e}"));
-                        let _ = std::fs::remove_file(backup)
-                            .map_err(|e| log::error!("Failed to remove backup file on write: {e}"));
                     })
                     .await;
                 }
-            }
 
-            write_result?;
+                let rename_result = fs::rename(&t_path, &write_path).await;
+
+                // Windows-specific retry loop for transient locks (e.g. Antivirus)
+                #[cfg(windows)]
+                if rename_result.is_err() {
+                    for _ in 0..5 {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        rename_result = fs::rename(&t_path, &write_path).await;
+                        if rename_result.is_ok() { break; }
+                    }
+                }
+
+                if let Err(e) = rename_result {
+                    let _ = fs::remove_file(&t_path).await;
+                    return Err(e.into());
+                }
+            }
 
             let event = DocumentSavedEvent {
                 revision: current_rev,
